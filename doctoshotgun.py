@@ -10,6 +10,7 @@ import datetime
 import argparse
 import getpass
 import unicodedata
+import socket
 
 from dateutil.parser import parse as parse_date
 from dateutil.relativedelta import relativedelta
@@ -25,14 +26,16 @@ from woob.tools.log import createColoredFormatter
 
 try:
     from playsound import playsound as _playsound, PlaysoundException
+
     def playsound(*args):
         try:
             return _playsound(*args)
-        except (PlaysoundException,ModuleNotFoundError):
-            pass # do not crash if, for one reason or another, something wrong happens
+        except (PlaysoundException, ModuleNotFoundError):
+            pass  # do not crash if, for one reason or another, something wrong happens
 except ImportError:
     def playsound(*args):
         pass
+
 
 def log(text, *args, **kwargs):
     args = (colored(arg, 'yellow') for arg in args)
@@ -199,7 +202,7 @@ class Doctolib(LoginBrowser):
                 raise e
 
         for i in self.page.iter_centers_ids():
-            page = self.center_result.open(id=i, params={'ref_visit_motive_ids[]': self.ref_visit_motive_ids, 'search_result_format': 'json'})
+            page = self.center_result.open(id=i, params={'limit': '4', 'ref_visit_motive_ids[]': self.ref_visit_motive_ids, 'search_result_format': 'json'})
             try:
                 yield page.doc['search_result']
             except KeyError:
@@ -245,7 +248,8 @@ class Doctolib(LoginBrowser):
                                            'agenda_ids': '-'.join(agenda_ids),
                                            'insurance_sector': 'public',
                                            'practice_ids': practice_id,
-                                           'destroy_temporary': 'true'})
+                                           'destroy_temporary': 'true',
+                                           'limit': 4})
             if 'next_slot' in self.page.doc:
                 date = self.page.doc['next_slot']
             else:
@@ -269,6 +273,8 @@ class Doctolib(LoginBrowser):
         data = {'agenda_ids': '-'.join(agenda_ids),
                 'appointment': {'profile_id': profile_id,
                                 'source_action': 'profile',
+                                'insurance_sector': 'public',
+                                'new_patient': True,
                                 'start_date': slot['start_date'],
                                 'visit_motive_ids': str(motive_id)},
                 'practice_ids': [practice_id]}
@@ -281,41 +287,34 @@ class Doctolib(LoginBrowser):
 
         playsound('ding.mp3')
 
-        # self.second_shot_availabilities.go(params={'start_date': slot['steps'][1]['start_date'].split('T')[0],
-        #                                            'visit_motive_ids': motive_id,
-        #                                            'agenda_ids': '-'.join(agenda_ids),
-        #                                            'first_slot': slot['start_date'],
-        #                                            'insurance_sector': 'public',
-        #                                            'practice_ids': practice_id,
-        #                                            'limit': 3})
-        #
-        # second_slot = self.page.find_best_slot(limit=False)
-        # if not second_slot:
-        #     log('  └╴ No second shot found')
-        #     return False
-        #
-        # log('  ├╴ Second shot: %s', parse_date(second_slot['start_date']).strftime('%c'))
-        #
-        # data['second_slot'] = second_slot['start_date']
-        # self.appointment.go(data=json.dumps(data), headers=headers)
-        #
-        # if self.page.is_error():
-        #     log('  └╴ Appointment not available anymore :( %s', self.page.get_error())
-        #     return False
+        self.second_shot_availabilities.go(params={'start_date': slot['steps'][1]['start_date'].split('T')[0],
+                                                   'visit_motive_ids': motive_id,
+                                                   'agenda_ids': '-'.join(agenda_ids),
+                                                   'first_slot': slot['start_date'],
+                                                   'insurance_sector': 'public',
+                                                   'practice_ids': practice_id,
+                                                   'limit': 4})
+
+        second_slot = self.page.find_best_slot(limit=False)
+        if not second_slot:
+            log('  └╴ No second shot found')
+            return False
+
+        log('  ├╴ Second shot: %s', parse_date(second_slot['start_date']).strftime('%c'))
+
+        data['second_slot'] = second_slot['start_date']
+        self.appointment.go(data=json.dumps(data), headers=headers)
+
+        if self.page.is_error():
+            log('  └╴ Appointment not available anymore :( %s', self.page.get_error())
+            return False
 
         a_id = self.page.doc['id']
 
         self.appointment_edit.go(id=a_id)
-        if 'flash' in self.page and 'error' in self.page['flash']:
-            log('  └╴ Appointment not available anymore :( %s', self.page['flash']['error'])
-            return False
-
         log('  ├╴ Booking for %s %s...', self.patient['first_name'], self.patient['last_name'])
 
         self.appointment_edit.go(id=a_id, params={'master_patient_id': self.patient['id']})
-        if 'flash' in self.page and 'error' in self.page['flash']:
-            log('  └╴ Appointment not available anymore :( %s', self.page['flash']['error'])
-            return False
 
         custom_fields = {}
         for field in self.page.get_custom_fields():
@@ -341,12 +340,10 @@ class Doctolib(LoginBrowser):
                 'phone_number': None}
 
         self.appointment_post.go(id=a_id, data=json.dumps(data), headers=headers, method='PUT')
-
         if 'redirection' in self.page.doc and 'confirmed-appointment' not in self.page.doc['redirection']:
             log('  ├╴ Open %s to complete', self.BASEURL + self.page.doc['redirection'])
 
         self.appointment_post.go(id=a_id)
-
         log('  └╴ Booking status: %s', self.page.doc['confirmed'])
 
         return self.page.doc['confirmed']
@@ -414,16 +411,20 @@ class Application:
         log('This may take a few minutes/hours, be patient!')
 
         while True:
-            for center in docto.find_centers():
-                log('')
-                log('Center %s:', center['name_with_title'])
-
-                if docto.try_to_book(center):
+            try:
+                for center in docto.find_centers():
                     log('')
-                    log('💉 %s Congratulations.' % colored('Booked!', 'green', attrs=('bold',)))
-                    return 0
+                    log('Center %s:', center['name_with_title'])
 
-                sleep(1)
+                    if docto.try_to_book(center):
+                        log('')
+                        log('💉 %s Congratulations.' % colored('Booked!', 'green', attrs=('bold',)))
+                        return 0
+
+                    sleep(1)
+            except socket.timeout:
+                log('')
+                log('Socket timeout occurred. Continue to search...', color='red')
 
             sleep(1)
 
