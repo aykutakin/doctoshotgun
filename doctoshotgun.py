@@ -210,6 +210,9 @@ class Doctolib(LoginBrowser):
             except KeyError:
                 pass
 
+        if city == 'berlin':
+            yield {'name_with_title': 'Corona Impfzentren - Berlin', 'url': f'{self.BASEURL}/institut/berlin/ciz-berlin-berlin'}
+
     def get_patients(self):
         self.master_patient.go()
 
