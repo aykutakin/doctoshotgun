@@ -1,6 +1,11 @@
-# [WIP] DOCTOSHOTGUN
+# DOCTOSHOTGUN
 
-This script lets you automatically book a vaccine slot on Doctolib for Berlin.
+This script lets you automatically book a vaccine slot on Doctolib for Germany.
+
+It searches for:
+- BioNTech/Pfizer
+- Moderna
+- Johnson & Johnson
 
 
 <p align="center">
@@ -18,7 +23,7 @@ pip install -r requirements.txt
 Run:
 
 ```
-./doctoshotgun.py <email> [password]
+./doctoshotgun.py <city> <email> [password]
 ```
 
 Optional arguments:

@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-import sys
-import re
-import logging
-import tempfile
-from time import sleep
-import json
-from urllib.parse import urlparse
-import datetime
 import argparse
+import cloudscraper
+import datetime
 import getpass
+import json
+import logging
+import re
+import sys
+import tempfile
 import unicodedata
-import socket
-
 from dateutil.parser import parse as parse_date
 from dateutil.relativedelta import relativedelta
-
-import cloudscraper
 from termcolor import colored
-
-from woob.browser.exceptions import ClientError, ServerError
+from time import sleep
+from urllib.parse import urlparse
+from urllib3.exceptions import ReadTimeoutError
 from woob.browser.browsers import LoginBrowser
-from woob.browser.url import URL
+from woob.browser.exceptions import ClientError, ServerError
 from woob.browser.pages import JsonPage, HTMLPage
+from woob.browser.url import URL
 from woob.tools.log import createColoredFormatter
 
 try:
@@ -107,9 +104,9 @@ class CenterBookingPage(JsonPage):
 
 
 class AvailabilitiesPage(JsonPage):
-    def find_best_slot(self, limit=True):
+    def find_best_slot(self):
         for a in self.doc['availabilities']:
-            if limit and parse_date(a['date']).date() > datetime.date.today() + relativedelta(days=1):
+            if parse_date(a['date']).date() > datetime.date.today() + relativedelta(days=1):
                 continue
             if len(a['slots']) == 0:
                 continue
@@ -143,11 +140,15 @@ class MasterPatientPage(JsonPage):
         return '%s %s' % (self.doc[0]['first_name'], self.doc[0]['last_name'])
 
 
+class CityNotFound(Exception):
+    pass
+
+
 class Doctolib(LoginBrowser):
     BASEURL = 'https://www.doctolib.de'
 
     login = URL('/login.json', LoginPage)
-    centers = URL(r'/impfung-covid-19-corona/berlin', CentersPage)
+    centers = URL(r'/impfung-covid-19-corona/(?P<where>\w+)', CentersPage)
     center_result = URL(r'/search_results/(?P<id>\d+).json', CenterResultPage)
     center_booking = URL(r'/booking/(?P<center_id>.+).json', CenterBookingPage)
     availabilities = URL(r'/availabilities.json', AvailabilitiesPage)
@@ -192,14 +193,15 @@ class Doctolib(LoginBrowser):
 
         return True
 
-    def find_centers(self):
+    def find_centers(self, city):
         try:
-            self.centers.go(params={'ref_visit_motive_ids[]': self.ref_visit_motive_ids})
+            self.centers.go(where=city, params={'ref_visit_motive_ids[]': self.ref_visit_motive_ids})
         except ServerError as e:
             if e.response.status_code in [503]:
-                return None
-            else:
-                raise e
+                return
+            raise
+        except HTTPNotFound as e:
+            raise CityNotFound(city) from e
 
         for i in self.page.iter_centers_ids():
             page = self.center_result.open(id=i, params={'limit': '4', 'ref_visit_motive_ids[]': self.ref_visit_motive_ids, 'search_result_format': 'json'})
@@ -212,6 +214,13 @@ class Doctolib(LoginBrowser):
         self.master_patient.go()
 
         return self.page.get_patients()
+
+    @classmethod
+    def normalize(cls, string):
+        nfkd = unicodedata.normalize('NFKD', string)
+        normalized = u"".join([c for c in nfkd if not unicodedata.combining(c)])
+        normalized = re.sub(r'\W', '-', normalized)
+        return normalized.lower()
 
     def try_to_book(self, center):
         self.open(center['url'])
@@ -259,11 +268,11 @@ class Doctolib(LoginBrowser):
             log('no availabilities', color='red')
             return False
 
-        slot = self.page.find_best_slot(limit=False)
+        slot = self.page.find_best_slot()
         if not slot:
             log('first slot not found :(', color='red')
             return False
-        if type(slot) != dict:
+        if not isinstance(slot, dict):
             log('error while fetching first slot.', color='red')
             return False
 
@@ -295,7 +304,7 @@ class Doctolib(LoginBrowser):
                                                    'practice_ids': practice_id,
                                                    'limit': 4})
 
-        second_slot = self.page.find_best_slot(limit=False)
+        second_slot = self.page.find_best_slot()
         if not second_slot:
             log('  └╴ No second shot found')
             return False
@@ -367,6 +376,7 @@ class Application:
         parser = argparse.ArgumentParser(description="Book a vaccine slot on Doctolib")
         parser.add_argument('--debug', '-d', action='store_true', help='show debug information')
         parser.add_argument('--patient', '-p', type=int, default=-1, help='give patient ID')
+        parser.add_argument('city', help='city where to book')
         parser.add_argument('username', help='Doctolib username')
         parser.add_argument('password', nargs='?', help='Doctolib password')
         args = parser.parse_args()
@@ -409,22 +419,23 @@ class Application:
 
         log('Starting to look for vaccine slots for %s %s...', docto.patient['first_name'], docto.patient['last_name'])
         log('This may take a few minutes/hours, be patient!')
+        city = docto.normalize(args.city)
 
         while True:
             try:
-                for center in docto.find_centers():
-                    log('')
-                    log('Center %s:', center['name_with_title'])
+                for center in docto.find_centers(city):
+                    log('\nCenter %s:', center['name_with_title'])
 
                     if docto.try_to_book(center):
-                        log('')
-                        log('💉 %s Congratulations.' % colored('Booked!', 'green', attrs=('bold',)))
+                        log('\n💉 %s Congratulations.' % colored('Booked!', 'green', attrs=('bold',)))
                         return 0
 
                     sleep(1)
-            except socket.timeout:
-                log('')
-                log('Socket timeout occurred. Continue to search...', color='red')
+            except CityNotFound as e:
+                print('\n%s: City %s not found. For now Doctoshotgun works only in Germany.' % (colored('Error', 'red'), colored(e, 'yellow')))
+                return 1
+            except ReadTimeoutError:
+                print('\nTimeout occurred. Retrying...')
 
             sleep(1)
 
