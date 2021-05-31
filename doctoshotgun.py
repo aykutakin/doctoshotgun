@@ -15,8 +15,9 @@ from termcolor import colored
 from time import sleep
 from urllib.parse import urlparse
 from urllib3.exceptions import ReadTimeoutError
+from requests.exceptions import ConnectionError, ReadTimeout
 from woob.browser.browsers import LoginBrowser
-from woob.browser.exceptions import ClientError, ServerError
+from woob.browser.exceptions import ClientError, ServerError, HTTPNotFound
 from woob.browser.pages import JsonPage, HTMLPage
 from woob.browser.url import URL
 from woob.tools.log import createColoredFormatter
@@ -74,11 +75,12 @@ class CenterPage(HTMLPage):
 
 class CenterBookingPage(JsonPage):
     def find_motive(self, regex):
+        motive_ids = []
         for s in self.doc['data']['visit_motives']:
             if re.search(regex, s['name']):
-                return s['id']
+                motive_ids.append(str(s['id']))
 
-        return None
+        return motive_ids
 
     def get_motives(self):
         return [s['name'] for s in self.doc['data']['visit_motives']]
@@ -89,13 +91,14 @@ class CenterBookingPage(JsonPage):
     def get_practice(self):
         return self.doc['data']['places'][0]['practice_ids'][0]
 
-    def get_agenda_ids(self, motive_id, practice_id=None):
+    def get_agenda_ids(self, motive_ids, practice_id=None):
         agenda_ids = []
         for a in self.doc['data']['agendas']:
-            if motive_id in a['visit_motive_ids'] and \
-               not a['booking_disabled'] and \
-               (not practice_id or a['practice_id'] == practice_id):
-                agenda_ids.append(str(a['id']))
+            for motive_id in motive_ids:
+                if int(motive_id) in a['visit_motive_ids'] and \
+                   not a['booking_disabled'] and \
+                   (not practice_id or a['practice_id'] == practice_id):
+                    agenda_ids.append(str(a['id']))
 
         return agenda_ids
 
@@ -232,9 +235,9 @@ class Doctolib(LoginBrowser):
 
         center_page = self.center_booking.go(center_id=center_id)
         profile_id = self.page.get_profile_id()
-        motive_id = self.page.find_motive(r'.*(Pfizer|Moderna|Janssen)')
+        motive_ids = self.page.find_motive(r'.*(Pfizer|Moderna|Janssen)')
 
-        if not motive_id:
+        if not motive_ids:
             log('Unable to find searched motive')
             log('Motives: %s', ', '.join(self.page.get_motives()))
             return False
@@ -242,21 +245,21 @@ class Doctolib(LoginBrowser):
         for place in self.page.get_places():
             log('– %s...', place['name'], end=' ', flush=True)
             practice_id = place['practice_ids'][0]
-            agenda_ids = center_page.get_agenda_ids(motive_id, practice_id)
-            if len(agenda_ids) == 0:
+            agenda_ids = center_page.get_agenda_ids(motive_ids, practice_id)
+            if not agenda_ids:
                 # do not filter to give a chance
-                agenda_ids = center_page.get_agenda_ids(motive_id)
+                agenda_ids = center_page.get_agenda_ids(motive_ids)
 
-            if self.try_to_book_place(profile_id, motive_id, practice_id, agenda_ids):
+            if self.try_to_book_place(profile_id, motive_ids, practice_id, agenda_ids):
                 return True
 
         return False
 
-    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids):
+    def try_to_book_place(self, profile_id, motive_ids, practice_id, agenda_ids):
         date = datetime.date.today().strftime('%Y-%m-%d')
         while date is not None:
             self.availabilities.go(params={'start_date': date,
-                                           'visit_motive_ids': motive_id,
+                                           'visit_motive_ids': '-'.join(motive_ids),
                                            'agenda_ids': '-'.join(agenda_ids),
                                            'insurance_sector': 'public',
                                            'practice_ids': practice_id,
@@ -288,7 +291,7 @@ class Doctolib(LoginBrowser):
                                 'insurance_sector': 'public',
                                 'new_patient': True,
                                 'start_date': slot['start_date'],
-                                'visit_motive_ids': str(motive_id)},
+                                'visit_motive_ids': '-'.join(motive_ids)},
                 'practice_ids': [practice_id]}
 
         headers = {'content-type': 'application/json'}
@@ -300,7 +303,7 @@ class Doctolib(LoginBrowser):
         playsound('ding.mp3')
 
         self.second_shot_availabilities.go(params={'start_date': slot['steps'][1]['start_date'].split('T')[0],
-                                                   'visit_motive_ids': motive_id,
+                                                   'visit_motive_ids': '-'.join(motive_ids),
                                                    'agenda_ids': '-'.join(agenda_ids),
                                                    'first_slot': slot['start_date'],
                                                    'insurance_sector': 'public',
@@ -437,7 +440,7 @@ class Application:
             except CityNotFound as e:
                 print('\n%s: City %s not found. For now Doctoshotgun works only in Germany.' % (colored('Error', 'red'), colored(e, 'yellow')))
                 return 1
-            except ReadTimeoutError:
+            except (ReadTimeout, ReadTimeoutError, ConnectionError):
                 print('\nTimeout occurred. Retrying...')
 
             sleep(1)
