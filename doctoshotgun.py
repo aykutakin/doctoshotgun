@@ -109,8 +109,6 @@ class CenterBookingPage(JsonPage):
 class AvailabilitiesPage(JsonPage):
     def find_best_slot(self):
         for a in self.doc['availabilities']:
-            if parse_date(a['date']).date() > datetime.date.today() + relativedelta(days=1):
-                continue
             if len(a['slots']) == 0:
                 continue
             return a['slots'][-1]
